@@ -49,13 +49,15 @@ v2Router.get("/_catalog", async (req, env: Env) => {
   }
 
   const url = new URL(req.url);
+  url.searchParams.set("n", `${n ?? 1000}`);
+  url.searchParams.set("last", response.cursor ?? "");
   return new Response(
     JSON.stringify({
       repositories: response.repositories,
     }),
     {
       headers: {
-        "Link": `${url.protocol}//${url.hostname}${url.pathname}?n=${n ?? 1000}&last=${response.cursor ?? ""}; rel=next`,
+        "Link": formatNextLink(url),
         "Content-Type": "application/json",
       },
     },
@@ -698,7 +700,7 @@ v2Router.get("/:name+/tags/list", async (req, env: Env) => {
   };
   // Only supply a next link if the previous result is truncated
   if (tags.truncated) {
-    responseHeaders.Link = `${url.toString()}; rel=next`;
+    responseHeaders.Link = formatNextLink(url);
   }
   return new Response(
     JSON.stringify({
