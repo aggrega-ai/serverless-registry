@@ -19,6 +19,7 @@ import {
 } from "./registry/registry";
 import { RegistryHTTPClient } from "./registry/http";
 import { ociImageIndexContentType } from "./media-types";
+import { listingETag, matchesIfNoneMatch, strongETag } from "./conditional";
 
 const maxReferrersListLimit = 1000;
 const isOpaqueReferrersCursor = (cursor: string) => cursor.startsWith("/v2/");
@@ -31,6 +32,70 @@ function formatNextLink(url: URL): string {
 // drops the Content-Length the distribution spec requires on blob/manifest GET and HEAD. Bodies are
 // served verbatim. Spread into each such response's headers.
 const identityEncoding = { "Content-Encoding": "identity" } as const;
+
+// Cache-Control for content-addressed responses (blobs, and manifests fetched by digest): the bytes
+// for a given digest never change, so they may be cached indefinitely.
+const immutableCacheControl = "public, max-age=31536000, immutable";
+// Cache-Control for mutable responses (manifests fetched by tag, computed listings): cache but
+// revalidate with the entity-tag before reuse, so a stale copy is never served.
+const revalidateCacheControl = "public, no-cache";
+
+// manifestGetResponse builds the GET-manifest response, answering 304 Not Modified when the
+// request's If-None-Match matches the manifest's entity-tag (derived from its content digest) and
+// otherwise a 200 carrying the entity-tag and Cache-Control. A manifest fetched by digest is
+// immutable; one fetched by tag is revalidated.
+function manifestGetResponse(request: Request, manifest: GetManifestResponse, reference: string): Response {
+  const etag = strongETag(manifest.digest);
+  const cacheControl = isValidDigest(reference) ? immutableCacheControl : revalidateCacheControl;
+  if (matchesIfNoneMatch(request, etag)) {
+    return new Response(null, {
+      status: 304,
+      headers: {
+        "ETag": etag,
+        "Cache-Control": cacheControl,
+        "Docker-Content-Digest": manifest.digest,
+      },
+    });
+  }
+
+  return new Response(manifest.stream, {
+    headers: {
+      "Content-Length": manifest.size.toString(),
+      "Content-Type": manifest.contentType,
+      "Docker-Content-Digest": manifest.digest,
+      "ETag": etag,
+      "Cache-Control": cacheControl,
+      ...identityEncoding,
+    },
+  });
+}
+
+// blobGetResponse builds the GET-blob response. Blobs are addressed by digest and immutable, so the
+// entity-tag is derived from the digest and the body may be cached indefinitely; a matching
+// If-None-Match yields 304 Not Modified.
+function blobGetResponse(request: Request, layer: GetLayerResponse): Response {
+  const etag = strongETag(layer.digest);
+  if (matchesIfNoneMatch(request, etag)) {
+    return new Response(null, {
+      status: 304,
+      headers: {
+        "ETag": etag,
+        "Cache-Control": immutableCacheControl,
+        "Docker-Content-Digest": layer.digest,
+      },
+    });
+  }
+
+  return new Response(layer.stream, {
+    headers: {
+      "Docker-Content-Digest": layer.digest,
+      "Content-Length": `${layer.size}`,
+      "ETag": etag,
+      "Cache-Control": immutableCacheControl,
+      ...identityEncoding,
+    },
+  });
+}
 
 const v2Router = Router({ base: "/v2/" });
 
@@ -224,14 +289,7 @@ v2Router.get("/:name+/manifests/:reference", async (req, env: Env, context: Exec
   const { name, reference } = req.params;
   const res = await env.REGISTRY_CLIENT.getManifest(name, reference);
   if (!("response" in res)) {
-    return new Response(res.stream, {
-      headers: {
-        "Content-Length": res.size.toString(),
-        "Content-Type": res.contentType,
-        "Docker-Content-Digest": res.digest,
-        ...identityEncoding,
-      },
-    });
+    return manifestGetResponse(req, res, reference);
   }
 
   let getManifestResponse: GetManifestResponse | null = null;
@@ -275,14 +333,7 @@ v2Router.get("/:name+/manifests/:reference", async (req, env: Env, context: Exec
   if (getManifestResponse === null)
     return new Response(JSON.stringify(ManifestUnknownError(reference)), { status: 404, headers: jsonHeaders() });
 
-  return new Response(getManifestResponse.stream, {
-    headers: {
-      "Content-Length": getManifestResponse.size.toString(),
-      "Content-Type": getManifestResponse.contentType,
-      "Docker-Content-Digest": getManifestResponse.digest,
-      ...identityEncoding,
-    },
-  });
+  return manifestGetResponse(req, getManifestResponse, reference);
 });
 
 v2Router.put("/:name+/manifests/:reference", async (req, env: Env) => {
@@ -346,8 +397,26 @@ v2Router.get("/:name+/referrers/:digest", async (req, env: Env) => {
     url.searchParams.set("last", response.cursor);
   }
 
+  const body = JSON.stringify({
+    schemaVersion: 2,
+    mediaType: ociImageIndexContentType,
+    manifests: response.manifests,
+  });
+
+  // The referrers index has no single backing object, so its validator is a hash of the
+  // serialized listing; a matching If-None-Match revalidates without re-transferring it.
+  const etag = await listingETag(body);
+  if (matchesIfNoneMatch(req, etag)) {
+    return new Response(null, {
+      status: 304,
+      headers: { "ETag": etag, "Cache-Control": revalidateCacheControl },
+    });
+  }
+
   const headers: Record<string, string> = {
     "Content-Type": ociImageIndexContentType,
+    "ETag": etag,
+    "Cache-Control": revalidateCacheControl,
   };
   if (artifactType !== undefined) {
     headers["OCI-Filters-Applied"] = "artifactType";
@@ -356,30 +425,17 @@ v2Router.get("/:name+/referrers/:digest", async (req, env: Env) => {
     headers.Link = formatNextLink(url);
   }
 
-  return new Response(
-    JSON.stringify({
-      schemaVersion: 2,
-      mediaType: ociImageIndexContentType,
-      manifests: response.manifests,
-    }),
-    {
-      status: 200,
-      headers,
-    },
-  );
+  return new Response(body, {
+    status: 200,
+    headers,
+  });
 });
 
 v2Router.get("/:name+/blobs/:digest", async (req, env: Env, context: ExecutionContext) => {
   const { name, digest } = req.params;
   const res = await env.REGISTRY_CLIENT.getLayer(name, digest);
   if (!("response" in res)) {
-    return new Response(res.stream, {
-      headers: {
-        "Docker-Content-Digest": res.digest,
-        "Content-Length": `${res.size}`,
-        ...identityEncoding,
-      },
-    });
+    return blobGetResponse(req, res);
   }
 
   let layerResponse: GetLayerResponse | null = null;
@@ -412,13 +468,7 @@ v2Router.get("/:name+/blobs/:digest", async (req, env: Env, context: ExecutionCo
 
   if (layerResponse === null) return new Response(JSON.stringify(BlobUnknownError), { status: 404 });
 
-  return new Response(layerResponse.stream, {
-    headers: {
-      "Docker-Content-Digest": layerResponse.digest,
-      "Content-Length": `${layerResponse.size}`,
-      ...identityEncoding,
-    },
-  });
+  return blobGetResponse(req, layerResponse);
 });
 
 v2Router.delete("/:name+/blobs/uploads/:id", async (req, env: Env) => {
@@ -695,23 +745,35 @@ v2Router.get("/:name+/tags/list", async (req, env: Env) => {
   const url = new URL(req.url);
   url.searchParams.set("n", `${n}`);
   url.searchParams.set("last", keys.length ? keys[keys.length - 1] : "");
-  const responseHeaders: { "Content-Type": string; "Link"?: string } = {
+  const body = JSON.stringify({
+    name,
+    tags: keys,
+  });
+
+  // The tags list is computed from an R2 listing with no single backing object, so its
+  // validator is a hash of the serialized body; a matching If-None-Match revalidates the
+  // list without re-transferring it.
+  const etag = await listingETag(body);
+  if (matchesIfNoneMatch(req, etag)) {
+    return new Response(null, {
+      status: 304,
+      headers: { "ETag": etag, "Cache-Control": revalidateCacheControl },
+    });
+  }
+
+  const responseHeaders: Record<string, string> = {
     "Content-Type": "application/json",
+    "ETag": etag,
+    "Cache-Control": revalidateCacheControl,
   };
   // Only supply a next link if the previous result is truncated
   if (tags.truncated) {
     responseHeaders.Link = formatNextLink(url);
   }
-  return new Response(
-    JSON.stringify({
-      name,
-      tags: keys,
-    }),
-    {
-      status: 200,
-      headers: responseHeaders,
-    },
-  );
+  return new Response(body, {
+    status: 200,
+    headers: responseHeaders,
+  });
 });
 
 v2Router.delete("/:name+/blobs/:digest", async (req, env: Env) => {

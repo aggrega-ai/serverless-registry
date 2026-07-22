@@ -2697,3 +2697,117 @@ describe("mounted blob HEAD reports source metadata", () => {
     expect(head.headers.get("Docker-Content-Digest")).toEqual(digest);
   });
 });
+
+describe("v2 conditional GET", () => {
+  test("GET manifest by tag emits a strong ETag and honors If-None-Match", async () => {
+    const name = "conditional/manifest-tag";
+    const { sha256 } = await createManifest(name, await generateManifest(name), "v1");
+    const etag = `"${sha256}"`;
+
+    const initial = await fetch(createRequest("GET", `/v2/${name}/manifests/v1`, null));
+    expect(initial.status).toBe(200);
+    expect(initial.headers.get("etag")).toEqual(etag);
+    expect(initial.headers.get("docker-content-digest")).toEqual(sha256);
+    expect(initial.headers.get("cache-control")).toEqual("public, no-cache");
+
+    const notModified = await fetch(createRequest("GET", `/v2/${name}/manifests/v1`, null, { "If-None-Match": etag }));
+    expect(notModified.status).toBe(304);
+    expect(await notModified.text()).toEqual("");
+    expect(notModified.headers.get("etag")).toEqual(etag);
+
+    const stale = `"sha256:${"0".repeat(64)}"`;
+    const changed = await fetch(createRequest("GET", `/v2/${name}/manifests/v1`, null, { "If-None-Match": stale }));
+    expect(changed.status).toBe(200);
+    expect(changed.headers.get("etag")).toEqual(etag);
+  });
+
+  test("GET manifest by digest is immutable", async () => {
+    const name = "conditional/manifest-digest";
+    const { sha256 } = await createManifest(name, await generateManifest(name), "v1");
+    const res = await fetch(createRequest("GET", `/v2/${name}/manifests/${sha256}`, null));
+    expect(res.status).toBe(200);
+    expect(res.headers.get("etag")).toEqual(`"${sha256}"`);
+    expect(res.headers.get("cache-control")).toEqual("public, max-age=31536000, immutable");
+  });
+
+  test("GET missing manifest stays 404", async () => {
+    const res = await fetch(createRequest("GET", "/v2/conditional/absent/manifests/v1", null));
+    expect(res.status).toBe(404);
+  });
+
+  test("GET blob emits a strong ETag and honors If-None-Match", async () => {
+    const name = "conditional/blob";
+    const manifest = await generateManifest(name);
+    await createManifest(name, manifest, "v1");
+    const digest = getLayersFromManifest(manifest)[0];
+    const etag = `"${digest}"`;
+
+    const initial = await fetch(createRequest("GET", `/v2/${name}/blobs/${digest}`, null));
+    expect(initial.status).toBe(200);
+    expect(initial.headers.get("etag")).toEqual(etag);
+    expect(initial.headers.get("cache-control")).toEqual("public, max-age=31536000, immutable");
+
+    const notModified = await fetch(
+      createRequest("GET", `/v2/${name}/blobs/${digest}`, null, { "If-None-Match": etag }),
+    );
+    expect(notModified.status).toBe(304);
+    expect(await notModified.text()).toEqual("");
+    expect(notModified.headers.get("etag")).toEqual(etag);
+
+    const missing = await fetch(createRequest("GET", `/v2/${name}/blobs/sha256:${"0".repeat(64)}`, null));
+    expect(missing.status).toBe(404);
+  });
+
+  test("GET tags/list emits a synthetic ETag and honors If-None-Match", async () => {
+    const name = "conditional/tags";
+    await createManifest(name, await generateManifest(name), "v1");
+    await createManifest(name, await generateManifest(name), "v2");
+
+    const initial = await fetch(createRequest("GET", `/v2/${name}/tags/list?n=1000`, null));
+    expect(initial.status).toBe(200);
+    const etag = initial.headers.get("etag");
+    expect(etag).toMatch(/^"sha256:[a-f0-9]{64}"$/);
+
+    const notModified = await fetch(
+      createRequest("GET", `/v2/${name}/tags/list?n=1000`, null, { "If-None-Match": etag! }),
+    );
+    expect(notModified.status).toBe(304);
+    expect(await notModified.text()).toEqual("");
+    expect(notModified.headers.get("etag")).toEqual(etag);
+
+    // A changed tag set yields a different validator.
+    await createManifest(name, await generateManifest(name), "v3");
+    const changed = await fetch(createRequest("GET", `/v2/${name}/tags/list?n=1000`, null, { "If-None-Match": etag! }));
+    expect(changed.status).toBe(200);
+    expect(changed.headers.get("etag")).not.toEqual(etag);
+  });
+
+  test("GET referrers emits a synthetic ETag and honors If-None-Match", async () => {
+    const name = "conditional/referrers";
+    const subjectManifest = getImageManifestV2(await generateManifest(name));
+    const { sha256: subjectDigest } = await createManifest(name, subjectManifest, "latest");
+    const subjectDescriptor = {
+      mediaType: subjectManifest.mediaType,
+      digest: subjectDigest,
+      size: manifestSize(subjectManifest),
+    };
+    const artifactManifest = {
+      ...getImageManifestV2(await generateManifest(name)),
+      artifactType: "application/vnd.conditional.referrer.v1",
+      subject: subjectDescriptor,
+    } satisfies ManifestSchema;
+    await createManifest(name, artifactManifest);
+
+    const initial = await fetch(createRequest("GET", `/v2/${name}/referrers/${subjectDigest}`, null));
+    expect(initial.status).toBe(200);
+    const etag = initial.headers.get("etag");
+    expect(etag).toMatch(/^"sha256:[a-f0-9]{64}"$/);
+
+    const notModified = await fetch(
+      createRequest("GET", `/v2/${name}/referrers/${subjectDigest}`, null, { "If-None-Match": etag! }),
+    );
+    expect(notModified.status).toBe(304);
+    expect(await notModified.text()).toEqual("");
+    expect(notModified.headers.get("etag")).toEqual(etag);
+  });
+});
