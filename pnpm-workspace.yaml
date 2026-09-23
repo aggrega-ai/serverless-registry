@@ -5,3 +5,12 @@ allowBuilds:
   esbuild: true
   sharp: true
   workerd: true
+
+# Cloudflare packages are exempt from the release age check
+minimumReleaseAge: 1440 # 24 hours
+minimumReleaseAgeExclude:
+  - "@cloudflare/*"
+  - cloudflare
+  - miniflare
+  - workerd
+  - wrangler
