@@ -138,6 +138,14 @@ async function fetch(r: Request): Promise<Response> {
   return await fetchUnauth(r);
 }
 
+// Fetch without adding credentials, against a registry configured with the given username and password.
+async function fetchWithConfiguredUser(r: Request, username: string, password: string): Promise<Response> {
+  const ctx = createExecutionContext();
+  const res = await worker.fetch(r, { ...env, USERNAME: username, PASSWORD: password } as Env, ctx);
+  await waitOnExecutionContext(ctx);
+  return res as Response;
+}
+
 const username = "hello";
 
 describe("v2", () => {
@@ -202,6 +210,66 @@ describe("v2", () => {
       }),
     );
     expect(resAuthCorrect.ok).toBeTruthy();
+  });
+
+  // Credentials whose encoding differs between the standard and the URL-safe base64 alphabet.
+  const credentialsWithAlphabetSpecificEncoding = [
+    { username: "u", password: "???", standard: "dTo/Pz8=", urlSafe: "dTo_Pz8" },
+    { username: "u", password: ">>>", standard: "dTo+Pj4=", urlSafe: "dTo-Pj4" },
+  ];
+
+  test("Username password authentication accepts standard base64 credentials", async () => {
+    for (const { username, password, standard } of credentialsWithAlphabetSpecificEncoding) {
+      expect(btoa(`${username}:${password}`)).toEqual(standard);
+      for (const encoded of [standard, standard.replace(/=+$/, "")]) {
+        const res = await fetchWithConfiguredUser(
+          createRequest("GET", `/v2/`, null, { Authorization: `Basic ${encoded}` }),
+          username,
+          password,
+        );
+        expect(res.status).toBe(200);
+      }
+    }
+  });
+
+  test("Username password authentication accepts base64url credentials", async () => {
+    for (const { username, password, urlSafe } of credentialsWithAlphabetSpecificEncoding) {
+      expect(base64UrlEncode(`${username}:${password}`)).toEqual(urlSafe);
+      for (const encoded of [urlSafe, `${urlSafe}=`]) {
+        const res = await fetchWithConfiguredUser(
+          createRequest("GET", `/v2/`, null, { Authorization: `Basic ${encoded}` }),
+          username,
+          password,
+        );
+        expect(res.status).toBe(200);
+      }
+    }
+  });
+
+  test("Username password authentication fails when password is wrong in either base64 alphabet", async () => {
+    const [sent, configured] = credentialsWithAlphabetSpecificEncoding;
+    for (const encoded of [sent.standard, sent.urlSafe]) {
+      const res = await fetchWithConfiguredUser(
+        createRequest("GET", `/v2/`, null, { Authorization: `Basic ${encoded}` }),
+        configured.username,
+        configured.password,
+      );
+      expect(res.status).toBe(401);
+    }
+  });
+
+  test("Username password authentication fails gracefully when credentials are in neither base64 alphabet", async () => {
+    // btoa("u:?ab>") is "dTo/YWI+". The first two values swap one of its characters for the URL-safe
+    // counterpart, so they mix both alphabets and neither decodes them, although the credential is valid.
+    expect(btoa("u:?ab>")).toEqual("dTo/YWI+");
+    for (const encoded of ["dTo_YWI+", "dTo/YWI-", "%%%%"]) {
+      const res = await fetchWithConfiguredUser(
+        createRequest("GET", `/v2/`, null, { Authorization: `Basic ${encoded}` }),
+        "u",
+        "?ab>",
+      );
+      expect(res.status).toBe(401);
+    }
   });
 });
 

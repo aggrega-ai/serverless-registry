@@ -1,4 +1,4 @@
-import { base64UrlDecode, errorString } from "./utils";
+import { base64Decode, base64UrlDecode, errorString } from "./utils";
 
 export type RegistryTokenCapability = "push" | "pull";
 export type RegistryAuthProtocolTokenPayload = {
@@ -41,7 +41,7 @@ export function stripUsernamePasswordFromHeader(r: Request): [string, string] | 
 
   try {
     // Decodes the base64 value and performs unicode normalization.
-    const decoded = base64UrlDecode(encoded);
+    const decoded = decodeBasicCredentials(encoded);
 
     // The username & password are split by the first colon.
     //=> example: "username:password"
@@ -60,5 +60,17 @@ export function stripUsernamePasswordFromHeader(r: Request): [string, string] | 
   } catch (err) {
     console.error(`Failure getting data from Authorization header: ${errorString(err)}`);
     return { verified: false, payload: null };
+  }
+}
+
+// RFC 7617 encodes Basic credentials with the standard base64 alphabet, so a credential whose encoding contains
+// "+" or "/" must be decoded with it. The URL-safe alphabet is still accepted so clients that send it keep
+// working. The two alphabets differ only in "+/" versus "-_": a value valid in both decodes to the same bytes
+// either way, and a value mixing them is rejected by both.
+function decodeBasicCredentials(encoded: string): string {
+  try {
+    return base64Decode(encoded);
+  } catch {
+    return base64UrlDecode(encoded);
   }
 }
