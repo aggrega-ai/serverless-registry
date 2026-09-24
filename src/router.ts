@@ -113,6 +113,14 @@ v2Router.get("/_catalog", async (req, env: Env) => {
     return response.response;
   }
 
+  // Without a cursor this is the last page, and it carries no Link: its absence tells the client it has every
+  // repository.
+  if (response.cursor === undefined) {
+    return new Response(JSON.stringify({ repositories: response.repositories }), {
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
   const url = new URL(req.url);
   url.searchParams.set("n", `${n ?? 1000}`);
   url.searchParams.set("last", response.cursor ?? "");

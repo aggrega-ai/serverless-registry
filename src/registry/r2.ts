@@ -262,98 +262,48 @@ export class R2Registry implements Registry {
     // repositories from manifest paths with the following shape:
     //   <path>/manifests/<name>
     // This means we slice the last two items in the key and add them to our hash map.
-    // At the end, we start skipping entries until we find another unique key, then we return that entry as startAfter.
+    //
+    // `last` is the last repository of the previous page, as in the distribution spec, and the listing resumes
+    // after all of its manifest keys: "0" is the character after "/", so "<last>/manifests0" sorts after every
+    // "<last>/manifests/<name>" key.
+    //
+    // We look for one repository more than the limit: only if it exists is a cursor returned, so the client
+    // knows another page follows. The cursor is the last repository of this page.
+    const pageSize = limit ?? 1000;
+    const repositories: string[] = [];
+    const seen = new Set<string>();
 
-    const options = {
-      limit: limit ?? 1000,
-      startAfter: last ?? undefined,
-    };
-    const repositories = new Set<string>();
-    let totalRecords = 0;
-    let lastSeen: string | undefined;
-    const objectExistsInPath = (entry?: string) => {
-      if (entry === undefined) return false;
-      const parts = entry.split("/");
-      const repository = parts.slice(0, parts.length - 2).join("/");
-      return repositories.has(repository);
-    };
-
-    const repositoriesOrder: string[] = [];
-    const addObjectPath = (object: R2Object) => {
-      if (totalRecords >= options.limit && !objectExistsInPath(object.key)) {
-        return;
-      }
-
-      // update lastSeen for cursoring purposes
-      lastSeen = object.key;
-      // don't add if seen before
-      if (totalRecords >= options.limit) return;
-      // skip either 'manifests' or 'blobs'
-      // name format is:
-      // <path>/<'blobs' | 'manifests'>/<name>
-      const parts = object.key.split("/");
-      if (parts[parts.length - 2] !== "manifests") {
-        return;
-      }
-      const repository = parts.slice(0, parts.length - 2).join("/");
-
-      if (repositories.has(repository)) return;
-      totalRecords++;
-      repositories.add(repository);
-      repositoriesOrder.push(repository);
-    };
-
-    const r2Objects = await this.env.REGISTRY.list({
+    let objects = await this.env.REGISTRY.list({
       limit: 50,
-      startAfter: options.startAfter,
+      startAfter: last ? `${last}/manifests0` : undefined,
     });
-    r2Objects.objects.forEach((path) => addObjectPath(path));
-    let cursor = r2Objects.truncated ? r2Objects.cursor : undefined;
-    while (cursor !== undefined && totalRecords < options.limit) {
-      const next = await this.env.REGISTRY.list({
-        limit: 50,
-        cursor,
-      });
-      next.objects.forEach((path) => addObjectPath(path));
-      if (next.truncated) {
-        cursor = next.cursor;
-      } else {
-        cursor = undefined;
+    while (true) {
+      for (const object of objects.objects) {
+        const parts = object.key.split("/");
+        if (parts[parts.length - 2] !== "manifests") continue;
+        const repository = parts.slice(0, parts.length - 2).join("/");
+        if (seen.has(repository)) continue;
+        seen.add(repository);
+        repositories.push(repository);
       }
+
+      if (repositories.length > pageSize || !objects.truncated) break;
+      objects = await this.env.REGISTRY.list({
+        limit: 50,
+        cursor: objects.cursor,
+      });
     }
 
-    while (cursor !== undefined && typeof lastSeen === "string" && objectExistsInPath(lastSeen)) {
-      const nextList: R2Objects = await this.env.REGISTRY.list({
-        limit: 50,
-        cursor,
-      });
-
-      let found = false;
-      // Search for the next object in the list
-      for (const object of nextList.objects) {
-        if (!objectExistsInPath(lastSeen)) {
-          found = true;
-          break;
-        }
-
-        lastSeen = object.key;
-      }
-
-      if (found) break;
-
-      if (nextList.truncated) {
-        // jump to the next list and try to find a
-        // repository that hasn't been returned in this response
-        cursor = nextList.cursor;
-      } else {
-        // we arrived to the end of the list, no more cursor
-        cursor = undefined;
-      }
+    if (repositories.length > pageSize) {
+      const page = repositories.slice(0, pageSize);
+      return {
+        repositories: page,
+        cursor: page[page.length - 1],
+      };
     }
 
     return {
-      repositories: repositoriesOrder,
-      cursor: lastSeen,
+      repositories,
     };
   }
 

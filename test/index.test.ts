@@ -2065,6 +2065,32 @@ describe("http client", () => {
   });
 });
 
+// Follows the catalog's Link headers from `path` until a page carries none, and returns every page. A listing that
+// does not end within `maxPages` pages fails the test instead of hanging it.
+async function walkCatalog(path: string, maxPages = 20): Promise<{ repositories: string[]; link: string | null }[]> {
+  const pages: { repositories: string[]; link: string | null }[] = [];
+  let next: string | null = path;
+  while (next !== null) {
+    if (pages.length === maxPages) {
+      throw new Error(`catalog listing did not end within ${maxPages} pages`);
+    }
+
+    const response = await fetch(createRequest("GET", next, null));
+    expect(response.ok).toBeTruthy();
+    const body = (await response.json()) as { repositories: string[] };
+    const link = response.headers.get("Link");
+    pages.push({ repositories: body.repositories, link });
+    if (link === null) {
+      next = null;
+    } else {
+      const url = parseLinkHeaderURL(link);
+      next = url.pathname + url.search;
+    }
+  }
+
+  return pages;
+}
+
 describe("push and catalog", () => {
   test("push and then use the catalog", async () => {
     await createManifest("hello-world-main", await generateManifest("hello-world-main"), "hello");
@@ -2085,23 +2111,8 @@ describe("push and catalog", () => {
     expect(tags.name).toEqual("hello-world-main");
     expect(tags.tags).toEqual(["hello", "hello-2", "latest"]);
 
-    const repositoryBuildUp: string[] = [];
-    let currentPath = "/v2/_catalog?n=1";
-    for (let i = 0; i < 3; i++) {
-      const response = await fetch(createRequest("GET", currentPath, null));
-      expect(response.ok).toBeTruthy();
-      const body = (await response.json()) as { repositories: string[] };
-      if (body.repositories.length === 0) {
-        break;
-      }
-      expect(body.repositories).toHaveLength(1);
-
-      repositoryBuildUp.push(...body.repositories);
-      const url = parseLinkHeaderURL(response.headers.get("Link")!);
-      currentPath = url.pathname + url.search;
-    }
-
-    expect(repositoryBuildUp).toEqual(expectedRepositories);
+    const pages = await walkCatalog("/v2/_catalog?n=1");
+    expect(pages.map((page) => page.repositories)).toEqual(expectedRepositories.map((repository) => [repository]));
 
     // Check blobs count
     const bindings = env as Env;
@@ -2138,23 +2149,8 @@ describe("push and catalog", () => {
     expect(tags.name).toEqual("hello-world-main");
     expect(tags.tags).toEqual(["hello", "hello-2", "latest"]);
 
-    const repositoryBuildUp: string[] = [];
-    let currentPath = "/v2/_catalog?n=1";
-    for (let i = 0; i < 3; i++) {
-      const response = await fetch(createRequest("GET", currentPath, null));
-      expect(response.ok).toBeTruthy();
-      const body = (await response.json()) as { repositories: string[] };
-      if (body.repositories.length === 0) {
-        break;
-      }
-      expect(body.repositories).toHaveLength(1);
-
-      repositoryBuildUp.push(...body.repositories);
-      const url = parseLinkHeaderURL(response.headers.get("Link")!);
-      currentPath = url.pathname + url.search;
-    }
-
-    expect(repositoryBuildUp).toEqual(expectedRepositories);
+    const pages = await walkCatalog("/v2/_catalog?n=1");
+    expect(pages.map((page) => page.repositories)).toEqual(expectedRepositories.map((repository) => [repository]));
 
     // Check blobs count
     const bindings = env as Env;
@@ -2193,6 +2189,45 @@ describe("push and catalog", () => {
 
     expect(body.repositories).toContain(name);
     expect(body.repositories.filter((repository) => repository.startsWith(`${name}/_referrers`))).toEqual([]);
+  });
+
+  test("catalog pages end at the last repository", async () => {
+    const names = ["catalog/a", "catalog/b", "catalog/c", "catalog/d"];
+    for (const name of names) {
+      await createManifest(name, await generateManifest(name), "latest");
+    }
+
+    // n=1, n=2 and n=4 put a page boundary exactly on the last repository; n=3 ends on a partial page.
+    for (const n of [1, 2, 3, 4, 5, 1000]) {
+      const pages = await walkCatalog(`/v2/_catalog?n=${n}`);
+      expect(pages.flatMap((page) => page.repositories)).toEqual(names);
+      expect(pages).toHaveLength(Math.ceil(names.length / n));
+      for (const page of pages) {
+        expect(page.repositories.length).toBeLessThanOrEqual(n);
+        if (page.link !== null) {
+          expect(parseLinkHeaderURL(page.link).searchParams.get("last")).toEqual(page.repositories.at(-1));
+        }
+      }
+    }
+  });
+
+  test("catalog resumes after the repository named by last", async () => {
+    const names = ["catalog/a", "catalog/b", "catalog/c"];
+    for (const name of names) {
+      await createManifest(name, await generateManifest(name), "latest");
+    }
+
+    for (const [index, name] of names.entries()) {
+      const response = await fetch(createRequest("GET", `/v2/_catalog?n=1000&last=${name}`, null));
+      expect(response.ok).toBeTruthy();
+      const body = (await response.json()) as { repositories: string[] };
+      expect(body.repositories).toEqual(names.slice(index + 1));
+      expect(response.headers.get("Link")).toBeNull();
+    }
+  });
+
+  test("catalog of an empty registry is a single empty page", async () => {
+    expect(await walkCatalog("/v2/_catalog?n=1")).toEqual([{ repositories: [], link: null }]);
   });
 });
 
