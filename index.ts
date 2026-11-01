@@ -26,6 +26,7 @@ export interface Env {
   READONLY_ANONYMOUS?: string; // "true" allows unauthenticated pulls (GET/HEAD); writes still require auth
   PUSH_COMPATIBILITY_MODE?: PushCompatibilityMode;
   REGISTRIES_JSON?: string; // should be in the format of RegistryConfiguration[];
+  PULL_ANALYTICS?: AnalyticsEngineDataset; // optional: counts manifest pulls per repository and reference
   REGISTRY_CLIENT: Registry;
 }
 

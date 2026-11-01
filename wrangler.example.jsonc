@@ -21,6 +21,10 @@
       },
       // Secrets:
       // USERNAME/PASSWORD/READONLY_USERNAME/READONLY_PASSWORD if you want username/password based auth
+
+      // Optional: count manifest pulls per repository and reference with Workers Analytics Engine.
+      // Each successful manifest GET writes one data point; nothing about the client is recorded.
+      // "analytics_engine_datasets": [{ "binding": "PULL_ANALYTICS", "dataset": "registry_pulls" }],
     },
 
     // Dev - For local dev using `npx wrangler dev`

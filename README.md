@@ -92,6 +92,54 @@ The flag defaults off, preserving the existing behavior where every request requ
 authentication. Enable it only when the whole namespace served by the worker is meant to be
 world-readable.
 
+### Counting pulls (optional)
+
+The registry can count manifest pulls per repository and reference with
+[Workers Analytics Engine](https://developers.cloudflare.com/analytics/analytics-engine/). Add a dataset
+binding named `PULL_ANALYTICS` to your wrangler config file; the dataset is created on the first write:
+
+```jsonc
+// wrangler.jsonc
+"analytics_engine_datasets": [
+  { "binding": "PULL_ANALYTICS", "dataset": "registry_pulls" }
+]
+```
+
+```toml
+# wrangler.toml
+analytics_engine_datasets = [
+  { binding = "PULL_ANALYTICS", dataset = "registry_pulls" }
+]
+```
+
+Each manifest `GET` the registry answers successfully, from R2 or from a pull fallback, writes one data point:
+
+| Column   | Value                                                                      |
+| -------- | -------------------------------------------------------------------------- |
+| `index1` | the repository name, cut to 96 bytes (the sampling key)                    |
+| `blob1`  | the repository name                                                        |
+| `blob2`  | the reference exactly as requested: a tag or a digest                      |
+| `blob3`  | the status class of the response: `2xx`, or `3xx` for a `304 Not Modified` |
+
+Nothing else is written: no IP address, user agent, credential, token, account or location. `HEAD` requests,
+blob requests, uploads, tag listings, referrers and catalog requests write nothing, and neither does a manifest
+`GET` that fails. Without the binding nothing is written, and a failure to write never fails the pull.
+
+Pulls per repository and reference over the last 30 days, with the
+[SQL API](https://developers.cloudflare.com/analytics/analytics-engine/sql-api/) (the token needs the
+_Account Analytics Read_ permission). `SUM(_sample_interval)` counts correctly when the data has been sampled;
+add `AND blob3 = '2xx'` to the `WHERE` clause to leave out revalidations answered `304`:
+
+```bash
+$ curl "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT_ID/analytics_engine/sql" \
+    --header "Authorization: Bearer $API_TOKEN" \
+    --data "SELECT blob1 AS repository, blob2 AS reference, SUM(_sample_interval) AS pulls
+            FROM registry_pulls
+            WHERE timestamp > NOW() - INTERVAL '30' DAY
+            GROUP BY repository, reference
+            ORDER BY pulls DESC"
+```
+
 ### Using with Docker
 
 You can use this registry with Docker to push and pull images.

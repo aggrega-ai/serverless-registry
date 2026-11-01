@@ -20,6 +20,7 @@ import {
 import { RegistryHTTPClient } from "./registry/http";
 import { ociImageIndexContentType } from "./media-types";
 import { listingETag, matchesIfNoneMatch, strongETag } from "./conditional";
+import { recordManifestPull } from "./analytics";
 
 const maxReferrersListLimit = 1000;
 const isOpaqueReferrersCursor = (cursor: string) => cursor.startsWith("/v2/");
@@ -297,7 +298,7 @@ v2Router.get("/:name+/manifests/:reference", async (req, env: Env, context: Exec
   const { name, reference } = req.params;
   const res = await env.REGISTRY_CLIENT.getManifest(name, reference);
   if (!("response" in res)) {
-    return manifestGetResponse(req, res, reference);
+    return recordManifestPull(env, name, reference, manifestGetResponse(req, res, reference));
   }
 
   let getManifestResponse: GetManifestResponse | null = null;
@@ -341,7 +342,7 @@ v2Router.get("/:name+/manifests/:reference", async (req, env: Env, context: Exec
   if (getManifestResponse === null)
     return new Response(JSON.stringify(ManifestUnknownError(reference)), { status: 404, headers: jsonHeaders() });
 
-  return manifestGetResponse(req, getManifestResponse, reference);
+  return recordManifestPull(env, name, reference, manifestGetResponse(req, getManifestResponse, reference));
 });
 
 v2Router.put("/:name+/manifests/:reference", async (req, env: Env) => {

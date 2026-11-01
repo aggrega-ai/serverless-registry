@@ -3062,3 +3062,196 @@ describe("v2 conditional GET", () => {
     expect(notModified.headers.get("etag")).toEqual(etag);
   });
 });
+
+describe("manifest pull analytics (PULL_ANALYTICS)", () => {
+  // Headers identifying the client. No data point may carry any of them.
+  const clientHeaders = { "CF-Connecting-IP": "203.0.113.7", "User-Agent": "pull-analytics-test/1.0" };
+
+  function recordingDataset(): { dataset: AnalyticsEngineDataset; points: AnalyticsEngineDataPoint[] } {
+    const points: AnalyticsEngineDataPoint[] = [];
+    return {
+      points,
+      dataset: {
+        writeDataPoint(event?: AnalyticsEngineDataPoint) {
+          points.push(event ?? {});
+        },
+      },
+    };
+  }
+
+  async function fetchWithBindings(r: Request, bindings: Partial<Env>): Promise<Response> {
+    r.headers.append("Authorization", usernamePasswordToAuth(username, "world"));
+    const ctx = createExecutionContext();
+    const res = await worker.fetch(r, { ...env, ...bindings } as Env, ctx);
+    await waitOnExecutionContext(ctx);
+    return res as Response;
+  }
+
+  test("a manifest GET writes one point holding the repository, the reference and the status class", async () => {
+    const name = "analytics/manifest";
+    const { sha256 } = await createManifest(name, await generateManifest(name), "v1");
+    const { dataset, points } = recordingDataset();
+
+    const byTag = await fetchWithBindings(createRequest("GET", `/v2/${name}/manifests/v1`, null, clientHeaders), {
+      PULL_ANALYTICS: dataset,
+    });
+    expect(byTag.status).toBe(200);
+    expect(points).toStrictEqual([{ indexes: [name], blobs: [name, "v1", "2xx"] }]);
+
+    const byDigest = await fetchWithBindings(
+      createRequest("GET", `/v2/${name}/manifests/${sha256}`, null, clientHeaders),
+      { PULL_ANALYTICS: dataset },
+    );
+    expect(byDigest.status).toBe(200);
+
+    const notModified = await fetchWithBindings(
+      createRequest("GET", `/v2/${name}/manifests/v1`, null, { ...clientHeaders, "If-None-Match": `"${sha256}"` }),
+      { PULL_ANALYTICS: dataset },
+    );
+    expect(notModified.status).toBe(304);
+
+    expect(points).toStrictEqual([
+      { indexes: [name], blobs: [name, "v1", "2xx"] },
+      { indexes: [name], blobs: [name, sha256, "2xx"] },
+      { indexes: [name], blobs: [name, "v1", "3xx"] },
+    ]);
+    const written = JSON.stringify(points);
+    for (const identifying of [...Object.values(clientHeaders), usernamePasswordToAuth(username, "world")]) {
+      expect(written).not.toContain(identifying);
+    }
+  });
+
+  test("a repository name longer than the index limit is cut in the index and kept whole in the blob", async () => {
+    const name = `analytics/${"long-repository-name-".repeat(6)}end`;
+    expect(new TextEncoder().encode(name).length).toBeGreaterThan(96);
+    await createManifest(name, await generateManifest(name), "v1");
+    const { dataset, points } = recordingDataset();
+
+    const res = await fetchWithBindings(createRequest("GET", `/v2/${name}/manifests/v1`, null), {
+      PULL_ANALYTICS: dataset,
+    });
+    expect(res.status).toBe(200);
+    expect(points).toStrictEqual([{ indexes: [name.slice(0, 96)], blobs: [name, "v1", "2xx"] }]);
+  });
+
+  test("HEAD, blob, upload, tag-list, referrers and catalog requests write nothing", async () => {
+    const name = "analytics/not-counted";
+    const manifest = await generateManifest(name);
+    const { sha256 } = await createManifest(name, manifest, "v1");
+    const blobDigest = getLayersFromManifest(manifest)[0];
+    const { dataset, points } = recordingDataset();
+    const withAnalytics = { PULL_ANALYTICS: dataset };
+
+    const requests: [Request, number][] = [
+      [createRequest("HEAD", `/v2/${name}/manifests/v1`, null), 200],
+      [createRequest("HEAD", `/v2/${name}/manifests/${sha256}`, null), 200],
+      [createRequest("GET", `/v2/${name}/blobs/${blobDigest}`, null), 200],
+      [createRequest("HEAD", `/v2/${name}/blobs/${blobDigest}`, null), 200],
+      [
+        createRequest("PUT", `/v2/${name}/manifests/v2`, new Blob([JSON.stringify(manifest)]).stream(), {
+          "Content-Type": "application/gzip",
+        }),
+        201,
+      ],
+      [createRequest("POST", `/v2/${name}/blobs/uploads/`, null), 202],
+      [createRequest("GET", `/v2/${name}/tags/list`, null), 200],
+      [createRequest("GET", `/v2/${name}/referrers/${sha256}`, null), 200],
+      [createRequest("GET", "/v2/_catalog", null), 200],
+      [createRequest("GET", "/v2/", null), 200],
+    ];
+    for (const [request, status] of requests) {
+      const res = await fetchWithBindings(request, withAnalytics);
+      expect(`${request.method} ${new URL(request.url).pathname} ${res.status}`).toEqual(
+        `${request.method} ${new URL(request.url).pathname} ${status}`,
+      );
+      await res.arrayBuffer();
+    }
+
+    expect(points).toStrictEqual([]);
+  });
+
+  test("a manifest GET answered 404 writes nothing", async () => {
+    const { dataset, points } = recordingDataset();
+    const res = await fetchWithBindings(createRequest("GET", "/v2/analytics/absent/manifests/v1", null), {
+      PULL_ANALYTICS: dataset,
+    });
+    expect(res.status).toBe(404);
+    expect(points).toStrictEqual([]);
+  });
+
+  test("without the binding a manifest GET is served unchanged", async () => {
+    const name = "analytics/unbound";
+    const manifest = await generateManifest(name);
+    const { sha256 } = await createManifest(name, manifest, "v1");
+    expect((env as Env).PULL_ANALYTICS).toBeUndefined();
+
+    const res = await fetchWithBindings(createRequest("GET", `/v2/${name}/manifests/v1`, null), {});
+    expect(res.status).toBe(200);
+    expect(res.headers.get("Docker-Content-Digest")).toEqual(sha256);
+    expect(await res.text()).toEqual(JSON.stringify(manifest));
+  });
+
+  test("a binding that throws still serves the pull, status, headers and body intact", async () => {
+    const name = "analytics/throwing";
+    const manifest = await generateManifest(name);
+    await createManifest(name, manifest, "v1");
+    let calls = 0;
+    const throwing: AnalyticsEngineDataset = {
+      writeDataPoint() {
+        calls++;
+        throw new Error("analytics unavailable");
+      },
+    };
+    using warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const unbound = await fetchWithBindings(createRequest("GET", `/v2/${name}/manifests/v1`, null), {});
+    const res = await fetchWithBindings(createRequest("GET", `/v2/${name}/manifests/v1`, null), {
+      PULL_ANALYTICS: throwing,
+    });
+
+    expect(calls).toBe(1);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(res.status).toBe(unbound.status);
+    expect([...res.headers.entries()]).toStrictEqual([...unbound.headers.entries()]);
+    const body = await res.text();
+    expect(body).toEqual(await unbound.text());
+    expect(body).toEqual(JSON.stringify(manifest));
+  });
+
+  test("a manifest served from a fallback registry writes one point", async () => {
+    const name = "analytics/fallback";
+    const manifestBody = JSON.stringify({
+      schemaVersion: 2,
+      mediaType: "application/vnd.oci.image.manifest.v1+json",
+      config: { mediaType: "application/vnd.oci.image.config.v1+json", digest: numberedDigest(1), size: 2 },
+      layers: [],
+    });
+    const digest = await getSHA256(manifestBody);
+    using _fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const request = new Request(input as string | URL | Request, init);
+      const path = new URL(request.url).pathname;
+      if (path === "/v2/") {
+        return new Response(null, { status: 200 });
+      }
+      if (request.method === "GET" && path === `/v2/${name}/manifests/v1`) {
+        return new Response(manifestBody, {
+          headers: {
+            "Content-Type": "application/vnd.oci.image.manifest.v1+json",
+            "Content-Length": `${manifestBody.length}`,
+            "Docker-Content-Digest": digest,
+          },
+        });
+      }
+      return new Response(null, { status: 404 });
+    });
+    const { dataset, points } = recordingDataset();
+
+    const res = await fetchWithBindings(createRequest("GET", `/v2/${name}/manifests/v1`, null), {
+      PULL_ANALYTICS: dataset,
+      REGISTRIES_JSON: JSON.stringify([{ registry: "https://fallback.registry.com" }]),
+    });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toEqual(manifestBody);
+    expect(points).toStrictEqual([{ indexes: [name], blobs: [name, "v1", "2xx"] }]);
+  });
+});
