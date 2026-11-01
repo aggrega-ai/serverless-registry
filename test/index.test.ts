@@ -3087,7 +3087,7 @@ describe("manifest pull analytics (PULL_ANALYTICS)", () => {
     return res as Response;
   }
 
-  test("a manifest GET writes one point holding the repository, the reference and the status class", async () => {
+  test("a manifest GET writes one point holding the repository, the reference, the status class and the reference kind", async () => {
     const name = "analytics/manifest";
     const { sha256 } = await createManifest(name, await generateManifest(name), "v1");
     const { dataset, points } = recordingDataset();
@@ -3096,7 +3096,7 @@ describe("manifest pull analytics (PULL_ANALYTICS)", () => {
       PULL_ANALYTICS: dataset,
     });
     expect(byTag.status).toBe(200);
-    expect(points).toStrictEqual([{ indexes: [name], blobs: [name, "v1", "2xx"] }]);
+    expect(points).toStrictEqual([{ indexes: [name], blobs: [name, "v1", "2xx", "tag"] }]);
 
     const byDigest = await fetchWithBindings(
       createRequest("GET", `/v2/${name}/manifests/${sha256}`, null, clientHeaders),
@@ -3111,9 +3111,9 @@ describe("manifest pull analytics (PULL_ANALYTICS)", () => {
     expect(notModified.status).toBe(304);
 
     expect(points).toStrictEqual([
-      { indexes: [name], blobs: [name, "v1", "2xx"] },
-      { indexes: [name], blobs: [name, sha256, "2xx"] },
-      { indexes: [name], blobs: [name, "v1", "3xx"] },
+      { indexes: [name], blobs: [name, "v1", "2xx", "tag"] },
+      { indexes: [name], blobs: [name, sha256, "2xx", "digest"] },
+      { indexes: [name], blobs: [name, "v1", "3xx", "tag"] },
     ]);
     const written = JSON.stringify(points);
     for (const identifying of [...Object.values(clientHeaders), usernamePasswordToAuth(username, "world")]) {
@@ -3131,7 +3131,7 @@ describe("manifest pull analytics (PULL_ANALYTICS)", () => {
       PULL_ANALYTICS: dataset,
     });
     expect(res.status).toBe(200);
-    expect(points).toStrictEqual([{ indexes: [name.slice(0, 96)], blobs: [name, "v1", "2xx"] }]);
+    expect(points).toStrictEqual([{ indexes: [name.slice(0, 96)], blobs: [name, "v1", "2xx", "tag"] }]);
   });
 
   test("HEAD, blob, upload, tag-list, referrers and catalog requests write nothing", async () => {
@@ -3252,6 +3252,6 @@ describe("manifest pull analytics (PULL_ANALYTICS)", () => {
     });
     expect(res.status).toBe(200);
     expect(await res.text()).toEqual(manifestBody);
-    expect(points).toStrictEqual([{ indexes: [name], blobs: [name, "v1", "2xx"] }]);
+    expect(points).toStrictEqual([{ indexes: [name], blobs: [name, "v1", "2xx", "tag"] }]);
   });
 });

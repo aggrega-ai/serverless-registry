@@ -120,6 +120,7 @@ Each manifest `GET` the registry answers successfully, from R2 or from a pull fa
 | `blob1`  | the repository name                                                        |
 | `blob2`  | the reference exactly as requested: a tag or a digest                      |
 | `blob3`  | the status class of the response: `2xx`, or `3xx` for a `304 Not Modified` |
+| `blob4`  | the kind of reference: `digest` when `blob2` is a digest, otherwise `tag`  |
 
 Nothing else is written: no IP address, user agent, credential, token, account or location. `HEAD` requests,
 blob requests, uploads, tag listings, referrers and catalog requests write nothing, and neither does a manifest
@@ -128,15 +129,16 @@ blob requests, uploads, tag listings, referrers and catalog requests write nothi
 Pulls per repository and reference over the last 30 days, with the
 [SQL API](https://developers.cloudflare.com/analytics/analytics-engine/sql-api/) (the token needs the
 _Account Analytics Read_ permission). `SUM(_sample_interval)` counts correctly when the data has been sampled;
-add `AND blob3 = '2xx'` to the `WHERE` clause to leave out revalidations answered `304`:
+add `AND blob3 = '2xx'` to the `WHERE` clause to leave out revalidations answered `304`, and `AND blob4 = 'tag'`
+or `AND blob4 = 'digest'` to count only the pulls by tag or only those by digest:
 
 ```bash
 $ curl "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT_ID/analytics_engine/sql" \
     --header "Authorization: Bearer $API_TOKEN" \
-    --data "SELECT blob1 AS repository, blob2 AS reference, SUM(_sample_interval) AS pulls
+    --data "SELECT blob1 AS repository, blob2 AS reference, blob4 AS kind, SUM(_sample_interval) AS pulls
             FROM registry_pulls
             WHERE timestamp > NOW() - INTERVAL '30' DAY
-            GROUP BY repository, reference
+            GROUP BY repository, reference, kind
             ORDER BY pulls DESC"
 ```
 

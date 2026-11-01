@@ -1,5 +1,6 @@
 import { Env } from "..";
 import { errorString } from "./utils";
+import { isValidDigest } from "./user";
 
 // Pull counting with Workers Analytics Engine. When the optional PULL_ANALYTICS binding is
 // configured, every manifest GET the registry answers successfully writes one data point:
@@ -8,6 +9,7 @@ import { errorString } from "./utils";
 //   blob1  — the repository name
 //   blob2  — the reference exactly as requested: a tag or a digest
 //   blob3  — the status class of the response sent: "2xx", or "3xx" for a 304 Not Modified
+//   blob4  — the kind of reference: "digest" when blob2 is a digest, otherwise "tag"
 //
 // Nothing else is written: no client address, user agent, credential, token, account or
 // location. Without the binding nothing is written and the registry behaves the same.
@@ -28,13 +30,19 @@ export function recordManifestPull(env: Env, name: string, reference: string, re
   try {
     dataset.writeDataPoint({
       indexes: [samplingIndex(name)],
-      blobs: [name, reference, statusClass(response.status)],
+      blobs: [name, reference, statusClass(response.status), referenceKind(reference)],
     });
   } catch (err) {
     console.warn("Could not record the manifest pull:", errorString(err));
   }
 
   return response;
+}
+
+// referenceKind tells a digest reference from a tag with the same digest check the manifest
+// response uses to choose its Cache-Control.
+function referenceKind(reference: string): string {
+  return isValidDigest(reference) ? "digest" : "tag";
 }
 
 // statusClass maps a status code to its class, for example 200 to "2xx".
