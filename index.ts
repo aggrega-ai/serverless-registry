@@ -56,10 +56,16 @@ export default {
       return new AuthErrorResponse(request);
     }
 
-    const credentials =
-      env.READONLY_ANONYMOUS === "true" && !request.headers.get("Authorization")
-        ? RegistryTokens.verifyPayload(request, anonymousPullPayload())
-        : await authMethod.checkCredentials(request);
+    const anonymous = env.READONLY_ANONYMOUS === "true" && !request.headers.get("Authorization");
+    // Docker decides from the version check (GET /v2/) whether a registry needs credentials: if the
+    // anonymous ping succeeds, it never sends the logged-in credentials and every push fails. So the
+    // ping is always challenged, while the other anonymous reads stay open.
+    if (anonymous && isVersionCheck(request)) {
+      return new AuthErrorResponse(request);
+    }
+    const credentials = anonymous
+      ? RegistryTokens.verifyPayload(request, anonymousPullPayload())
+      : await authMethod.checkCredentials(request);
     if (!credentials.verified) {
       console.warn(`Not Authorized. authmode=${authMethod.authmode}. verified=false`);
       return new AuthErrorResponse(request);
@@ -115,6 +121,11 @@ async function serveTrustPolicy(request: Request, env: Env): Promise<Response> {
     "Cache-Control": "public, max-age=300",
   };
   return new Response(request.method === "HEAD" ? null : object.body, { status: 200, headers });
+}
+
+function isVersionCheck(request: Request): boolean {
+  const pathname = new URL(request.url).pathname;
+  return pathname === "/v2/" || pathname === "/v2";
 }
 
 // anonymousPullPayload returns a principal holding only the "pull" capability. It authorizes

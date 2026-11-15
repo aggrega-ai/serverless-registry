@@ -2672,8 +2672,19 @@ describe("anonymous pull (READONLY_ANONYMOUS)", () => {
     expect(manifest.status).toBe(401);
   });
 
-  test("flag ON: anonymous GET /v2/ succeeds", async () => {
-    const res = await fetchAnonymousReadonly(createRequest("GET", "/v2/", null));
+  test("flag ON: anonymous version check is challenged so clients send credentials", async () => {
+    for (const path of ["/v2/", "/v2"]) {
+      const res = await fetchAnonymousReadonly(createRequest("GET", path, null));
+      expect(res.status).toBe(401);
+      expect(res.headers.get("WWW-Authenticate")).not.toBeNull();
+    }
+  });
+
+  test("flag ON: authenticated version check succeeds", async () => {
+    const ctx = createExecutionContext();
+    const r = createRequest("GET", "/v2/", null, { Authorization: usernamePasswordToAuth(username, "world") });
+    const res = (await worker.fetch(r, { ...env, READONLY_ANONYMOUS: "true" } as Env, ctx)) as Response;
+    await waitOnExecutionContext(ctx);
     expect(res.status).toBe(200);
   });
 
