@@ -88,6 +88,20 @@ methods (`POST`/`PUT`/`PATCH`/`DELETE`) still require an authenticated push cred
 anonymous write is rejected with the usual `WWW-Authenticate` challenge. A request that does
 present an `Authorization` header always takes the normal credential path.
 
+With the flag on and username/password authentication configured, the registry also speaks the
+Docker token flow, so `docker pull` works anonymously and `docker push` works after
+`docker login`. The version check (`GET /v2/`) and every other unauthenticated request that needs
+a credential is answered with `401` and
+`WWW-Authenticate: Bearer realm="https://<host>/v2/token",service="<host>"`. The token endpoint,
+`GET /v2/token`, issues a token holding only `pull` to a request without credentials, and a token
+holding the user's capabilities to a request with valid `Basic` credentials (an OAuth2 password
+grant sent with `POST` is accepted too); invalid credentials are refused with `401`. Requests
+present the token as `Authorization: Bearer <token>`. Tokens expire after an hour and are signed
+with HMAC-SHA256 under a key derived from the configured credentials, so no further secret is
+needed and changing a password invalidates the tokens issued under it. `Basic` credentials keep
+working on every request. A registry authenticating with `JWT_REGISTRY_TOKENS_PUBLIC_KEY` keeps the
+`Basic` challenge.
+
 The flag defaults off, preserving the existing behavior where every request requires
 authentication. Enable it only when the whole namespace served by the worker is meant to be
 world-readable.

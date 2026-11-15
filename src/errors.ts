@@ -1,7 +1,9 @@
 import { State } from "./registry/r2";
 
 export class AuthErrorResponse extends Response {
-  constructor(r: Request) {
+  // challenge overrides the default Basic WWW-Authenticate value, for registries that point
+  // clients at a token endpoint instead.
+  constructor(r: Request, challenge?: string) {
     const jsonBody = JSON.stringify({
       errors: [
         {
@@ -15,7 +17,7 @@ export class AuthErrorResponse extends Response {
       status: 401,
       headers: {
         "content-type": "application/json;charset=UTF-8",
-        "WWW-Authenticate": `Basic realm="${r.url}"`,
+        "WWW-Authenticate": challenge ?? `Basic realm="${r.url}"`,
       },
     };
     super(jsonBody, init);

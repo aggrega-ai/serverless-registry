@@ -2672,11 +2672,13 @@ describe("anonymous pull (READONLY_ANONYMOUS)", () => {
     expect(manifest.status).toBe(401);
   });
 
-  test("flag ON: anonymous version check is challenged so clients send credentials", async () => {
+  test("flag ON: anonymous version check answers a Bearer challenge naming the token endpoint", async () => {
     for (const path of ["/v2/", "/v2"]) {
       const res = await fetchAnonymousReadonly(createRequest("GET", path, null));
       expect(res.status).toBe(401);
-      expect(res.headers.get("WWW-Authenticate")).not.toBeNull();
+      expect(res.headers.get("WWW-Authenticate")).toBe(
+        'Bearer realm="https://registry.com/v2/token",service="registry.com"',
+      );
     }
   });
 
@@ -2719,7 +2721,9 @@ describe("anonymous pull (READONLY_ANONYMOUS)", () => {
 
     const post = await fetchAnonymousReadonly(createRequest("POST", `/v2/${name}/blobs/uploads/`, null));
     expect(post.status).toBe(401);
-    expect(post.headers.get("WWW-Authenticate")).not.toBeNull();
+    expect(post.headers.get("WWW-Authenticate")).toBe(
+      `Bearer realm="https://registry.com/v2/token",service="registry.com",scope="repository:${name}:pull,push"`,
+    );
 
     const put = await fetchAnonymousReadonly(
       createRequest("PUT", `/v2/${name}/manifests/latest`, new Blob(["{}"]).stream(), {
@@ -2748,6 +2752,201 @@ describe("anonymous pull (READONLY_ANONYMOUS)", () => {
     const res = (await worker.fetch(r, { ...env, READONLY_ANONYMOUS: "true" } as Env, ctx)) as Response;
     await waitOnExecutionContext(ctx);
     expect(res.status).toBe(401);
+  });
+});
+
+// Fetch against the registry with READONLY_ANONYMOUS enabled and any further configuration given,
+// sending exactly the headers on the request.
+async function fetchTokenFlow(r: Request, overrides: Partial<Env> = {}): Promise<Response> {
+  const ctx = createExecutionContext();
+  const res = await worker.fetch(r, { ...env, READONLY_ANONYMOUS: "true", ...overrides } as Env, ctx);
+  await waitOnExecutionContext(ctx);
+  return res as Response;
+}
+
+type TokenResponse = { token: string; access_token: string; expires_in: number; issued_at: string };
+
+async function requestToken(headers: Record<string, string> = {}, overrides: Partial<Env> = {}): Promise<Response> {
+  return fetchTokenFlow(createRequest("GET", "/v2/token?service=registry.com", null, headers), overrides);
+}
+
+async function issuedToken(headers: Record<string, string> = {}, overrides: Partial<Env> = {}): Promise<string> {
+  const res = await requestToken(headers, overrides);
+  expect(res.status).toBe(200);
+  const body = (await res.json()) as TokenResponse;
+  return body.token;
+}
+
+function bearer(token: string): Record<string, string> {
+  return { Authorization: `Bearer ${token}` };
+}
+
+describe("registry tokens (READONLY_ANONYMOUS)", () => {
+  test("an anonymous token request is issued a token", async () => {
+    const res = await requestToken();
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as TokenResponse;
+    expect(body.token).toBeTruthy();
+    expect(body.access_token).toBe(body.token);
+    expect(body.expires_in).toBe(3600);
+    expect(Number.isNaN(Date.parse(body.issued_at))).toBe(false);
+  });
+
+  test("an anonymous token reads the version check, a manifest and a blob, and cannot push", async () => {
+    const name = "tokens/pullable";
+    const manifest = await generateManifest(name);
+    await createManifest(name, manifest, "latest");
+    const token = await issuedToken();
+
+    const ping = await fetchTokenFlow(createRequest("GET", "/v2/", null, bearer(token)));
+    expect(ping.status).toBe(200);
+    const byTag = await fetchTokenFlow(createRequest("GET", `/v2/${name}/manifests/latest`, null, bearer(token)));
+    expect(byTag.status).toBe(200);
+    const head = await fetchTokenFlow(createRequest("HEAD", `/v2/${name}/manifests/latest`, null, bearer(token)));
+    expect(head.status).toBe(200);
+    for (const layerDigest of getLayersFromManifest(manifest)) {
+      const blob = await fetchTokenFlow(createRequest("GET", `/v2/${name}/blobs/${layerDigest}`, null, bearer(token)));
+      expect(blob.status).toBe(200);
+    }
+
+    const upload = await fetchTokenFlow(createRequest("POST", `/v2/${name}/blobs/uploads/`, null, bearer(token)));
+    expect(upload.status).toBe(401);
+    expect(upload.headers.get("WWW-Authenticate")).toContain('Bearer realm="https://registry.com/v2/token"');
+  });
+
+  test("a token issued against valid credentials can push", async () => {
+    const token = await issuedToken({ Authorization: usernamePasswordToAuth(username, "world") });
+    const upload = await fetchTokenFlow(
+      createRequest("POST", "/v2/tokens/pushable/blobs/uploads/", null, bearer(token)),
+    );
+    expect(upload.status).toBe(202);
+  });
+
+  test("an OAuth2 password grant is issued a token that can push", async () => {
+    const form = new URLSearchParams({ grant_type: "password", username, password: "world", service: "registry.com" });
+    const res = await fetchTokenFlow(
+      new Request("https://registry.com/v2/token", {
+        method: "POST",
+        body: form,
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      }),
+    );
+    expect(res.status).toBe(200);
+    const { access_token } = (await res.json()) as TokenResponse;
+    const upload = await fetchTokenFlow(
+      createRequest("POST", "/v2/tokens/granted/blobs/uploads/", null, bearer(access_token)),
+    );
+    expect(upload.status).toBe(202);
+  });
+
+  test("a read-only user is issued a token that cannot push", async () => {
+    const overrides = { READONLY_USERNAME: "reader", READONLY_PASSWORD: "readonly" };
+    const token = await issuedToken({ Authorization: usernamePasswordToAuth("reader", "readonly") }, overrides);
+    const ping = await fetchTokenFlow(createRequest("GET", "/v2/", null, bearer(token)), overrides);
+    expect(ping.status).toBe(200);
+    const upload = await fetchTokenFlow(
+      createRequest("POST", "/v2/tokens/readonly/blobs/uploads/", null, bearer(token)),
+      overrides,
+    );
+    expect(upload.status).toBe(401);
+  });
+
+  test("invalid credentials are refused a token", async () => {
+    const wrong = await requestToken({ Authorization: usernamePasswordToAuth(username, "wrong") });
+    expect(wrong.status).toBe(401);
+    const unknown = await requestToken({ Authorization: usernamePasswordToAuth("nobody", "world") });
+    expect(unknown.status).toBe(401);
+    const notBasic = await requestToken({ Authorization: "Bearer something" });
+    expect(notBasic.status).toBe(401);
+  });
+
+  test("a forged token is rejected", async () => {
+    const token = await issuedToken();
+    const [body, signature] = token.split(".");
+    const claims = JSON.parse(Buffer.from(body, "base64url").toString("utf8")) as { cap: string[] };
+    claims.cap = ["pull", "push"];
+    const escalated = `${Buffer.from(JSON.stringify(claims)).toString("base64url")}.${signature}`;
+    const forgedCandidates = [
+      escalated,
+      `${body}.${Buffer.from("not the signature").toString("base64url")}`,
+      `${body}`,
+      "garbage",
+      `${body}.${signature}.extra`,
+    ];
+    for (const forged of forgedCandidates) {
+      const upload = await fetchTokenFlow(
+        createRequest("POST", "/v2/tokens/forged/blobs/uploads/", null, bearer(forged)),
+      );
+      expect(upload.status).toBe(401);
+      const ping = await fetchTokenFlow(createRequest("GET", "/v2/", null, bearer(forged)));
+      expect(ping.status).toBe(401);
+    }
+
+    // A token signed under another password does not verify here.
+    const otherKey = await issuedToken(
+      { Authorization: usernamePasswordToAuth(username, "other") },
+      {
+        PASSWORD: "other",
+      },
+    );
+    const res = await fetchTokenFlow(createRequest("POST", "/v2/tokens/forged/blobs/uploads/", null, bearer(otherKey)));
+    expect(res.status).toBe(401);
+
+    // A token issued by this registry for another host does not verify here.
+    const otherHost = await fetchTokenFlow(new Request("https://other.example/v2/token", { method: "GET" }));
+    const { token: otherHostToken } = (await otherHost.json()) as TokenResponse;
+    const ping = await fetchTokenFlow(createRequest("GET", "/v2/", null, bearer(otherHostToken)));
+    expect(ping.status).toBe(401);
+  });
+
+  test("an expired token is rejected", async () => {
+    const token = await issuedToken({ Authorization: usernamePasswordToAuth(username, "world") });
+    const now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now + 3601 * 1000);
+    try {
+      const ping = await fetchTokenFlow(createRequest("GET", "/v2/", null, bearer(token)));
+      expect(ping.status).toBe(401);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  test("Basic credentials keep working on every route", async () => {
+    const auth = { Authorization: usernamePasswordToAuth(username, "world") };
+    const ping = await fetchTokenFlow(createRequest("GET", "/v2/", null, auth));
+    expect(ping.status).toBe(200);
+    const upload = await fetchTokenFlow(createRequest("POST", "/v2/tokens/basic/blobs/uploads/", null, auth));
+    expect(upload.status).toBe(202);
+
+    const wrong = await fetchTokenFlow(
+      createRequest("GET", "/v2/", null, { Authorization: usernamePasswordToAuth(username, "wrong") }),
+    );
+    expect(wrong.status).toBe(401);
+    expect(wrong.headers.get("WWW-Authenticate")).toContain("Bearer ");
+  });
+
+  test("flag OFF: the registry keeps the Basic challenge and issues no tokens", async () => {
+    const ping = await fetchUnauth(createRequest("GET", "/v2/", null));
+    expect(ping.status).toBe(401);
+    expect(ping.headers.get("WWW-Authenticate")).toBe('Basic realm="https://registry.com/v2/"');
+
+    const tokenRequest = await fetchUnauth(createRequest("GET", "/v2/token", null));
+    expect(tokenRequest.status).toBe(401);
+    expect(tokenRequest.headers.get("WWW-Authenticate")).toContain("Basic ");
+
+    // A token issued while the flag was on is not a credential once it is off.
+    const token = await issuedToken();
+    const res = await fetchUnauth(createRequest("GET", "/v2/", null, bearer(token)));
+    expect(res.status).toBe(401);
+  });
+
+  test("a registry authenticating with JWT keeps the Basic challenge", async () => {
+    const [, publicKey] = await RegistryTokens.createPrivateAndPublicKey();
+    const ping = await fetchTokenFlow(createRequest("GET", "/v2/", null), {
+      JWT_REGISTRY_TOKENS_PUBLIC_KEY: publicKey,
+    });
+    expect(ping.status).toBe(401);
+    expect(ping.headers.get("WWW-Authenticate")).toContain("Basic ");
   });
 });
 

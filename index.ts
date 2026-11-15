@@ -10,6 +10,14 @@ import { RegistryTokens } from "./src/token";
 import type { RegistryAuthProtocolTokenPayload } from "./src/auth";
 import { Registry } from "./src/registry/registry";
 import { R2Registry } from "./src/registry/r2";
+import {
+  bearerChallenge,
+  bearerFlowEnabled,
+  BearerTokens,
+  isBearerAuthorization,
+  serveToken,
+  TOKEN_PATH,
+} from "./src/bearer";
 
 // A full compatibility mode means that the r2 registry will try its best to
 // help the client on the layer push. See how we let the client push layers with chunked uploads for more information.
@@ -56,19 +64,35 @@ export default {
       return new AuthErrorResponse(request);
     }
 
+    // With anonymous pull on, the registry runs the token flow (see src/bearer.ts): every challenge
+    // points the client at the token endpoint, which issues a pull token anonymously and a token
+    // holding the user's capabilities against valid credentials. Basic credentials are still
+    // accepted on every request.
+    const bearerTokens = bearerFlowEnabled(env) ? await BearerTokens.fromEnv(env) : undefined;
+    const unauthorized = (r: Request) =>
+      bearerTokens ? new AuthErrorResponse(r, bearerChallenge(r)) : new AuthErrorResponse(r);
+    if (bearerTokens && new URL(request.url).pathname === TOKEN_PATH) {
+      return serveToken(request, authMethod, bearerTokens, unauthorized);
+    }
+
     const anonymous = env.READONLY_ANONYMOUS === "true" && !request.headers.get("Authorization");
     // Docker decides from the version check (GET /v2/) whether a registry needs credentials: if the
     // anonymous ping succeeds, it never sends the logged-in credentials and every push fails. So the
     // ping is always challenged, while the other anonymous reads stay open.
     if (anonymous && isVersionCheck(request)) {
-      return new AuthErrorResponse(request);
+      return unauthorized(request);
     }
-    const credentials = anonymous
-      ? RegistryTokens.verifyPayload(request, anonymousPullPayload())
-      : await authMethod.checkCredentials(request);
+    let credentials;
+    if (anonymous) {
+      credentials = RegistryTokens.verifyPayload(request, anonymousPullPayload());
+    } else if (bearerTokens && isBearerAuthorization(request)) {
+      credentials = await bearerTokens.checkBearer(request);
+    } else {
+      credentials = await authMethod.checkCredentials(request);
+    }
     if (!credentials.verified) {
       console.warn(`Not Authorized. authmode=${authMethod.authmode}. verified=false`);
-      return new AuthErrorResponse(request);
+      return unauthorized(request);
     }
 
     env.REGISTRY_CLIENT = new R2Registry(env);
