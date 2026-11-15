@@ -45,6 +45,12 @@ export default {
       return new AuthErrorResponse(request);
     }
 
+    // The advertised trust policy is a public document a client fetches before it holds any
+    // credential, so it is served ahead of authentication, whatever the registry's read mode.
+    if (new URL(request.url).pathname === TRUST_POLICY_PATH) {
+      return serveTrustPolicy(request, env);
+    }
+
     const authMethod = await authenticationMethodFromEnv(env);
     if (!authMethod) {
       return new AuthErrorResponse(request);
@@ -87,6 +93,29 @@ export default {
     }
   },
 } satisfies ExportedHandler<Env>;
+
+// TRUST_POLICY_PATH is where a registry advertises its signature trust policy, and also the R2
+// object key the deploy uploads that document to. No repository name can begin with a dot, so the
+// key cannot collide with registry content.
+const TRUST_POLICY_PATH = "/.well-known/aggrega-trust";
+
+// serveTrustPolicy answers GET and HEAD for the advertised trust policy from R2, 404 when none was
+// uploaded, and 405 for any other method.
+async function serveTrustPolicy(request: Request, env: Env): Promise<Response> {
+  if (request.method !== "GET" && request.method !== "HEAD") {
+    return new Response("Method Not Allowed.", { status: 405, headers: { Allow: "GET, HEAD" } });
+  }
+  const object = await env.REGISTRY.get(TRUST_POLICY_PATH.slice(1));
+  if (object === null) {
+    return new Response("Not Found.", { status: 404 });
+  }
+  const headers = {
+    "Content-Type": "application/json",
+    "Content-Length": String(object.size),
+    "Cache-Control": "public, max-age=300",
+  };
+  return new Response(request.method === "HEAD" ? null : object.body, { status: 200, headers });
+}
 
 // anonymousPullPayload returns a principal holding only the "pull" capability. It authorizes
 // unauthenticated read requests (GET/HEAD) when READONLY_ANONYMOUS is enabled; writes still fail

@@ -2740,6 +2740,37 @@ describe("anonymous pull (READONLY_ANONYMOUS)", () => {
   });
 });
 
+describe("advertised trust policy", () => {
+  const policy = JSON.stringify({ requires_signatures: true, trusted_identities: [] });
+
+  test("served without credentials, whatever the read mode", async () => {
+    await (env as unknown as Env).REGISTRY.put(".well-known/aggrega-trust", policy);
+    const res = await fetchUnauth(createRequest("GET", "/.well-known/aggrega-trust", null));
+    expect(res.status).toBe(200);
+    expect(res.headers.get("Content-Type")).toBe("application/json");
+    expect(await res.text()).toBe(policy);
+
+    const head = await fetchUnauth(createRequest("HEAD", "/.well-known/aggrega-trust", null));
+    expect(head.status).toBe(200);
+    expect(head.headers.get("Content-Length")).toBe(String(policy.length));
+  });
+
+  test("404 when no policy was uploaded", async () => {
+    const res = await fetchUnauth(createRequest("GET", "/.well-known/aggrega-trust", null));
+    expect(res.status).toBe(404);
+  });
+
+  test("a write to the policy path is refused, not authenticated", async () => {
+    const res = await fetchUnauth(createRequest("PUT", "/.well-known/aggrega-trust", new Blob(["{}"]).stream()));
+    expect(res.status).toBe(405);
+  });
+
+  test("the registry API still requires credentials", async () => {
+    const res = await fetchUnauth(createRequest("GET", "/v2/", null));
+    expect(res.status).toBe(401);
+  });
+});
+
 describe("blob upload finalization error handling", () => {
   test("PUT finalize with a wrong digest is rejected 400 DIGEST_INVALID (not 500)", async () => {
     const name = "uploaderr/baddigest";
